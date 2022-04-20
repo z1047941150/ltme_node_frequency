@@ -1,3 +1,4 @@
+# Add some code to change the frequency 
 ROS driver for LitraTech's latest generation of mechanical 2D LiDARs running LDCP (**L**iDAR **D**ata and **C**ontrol **P**rotocol). Supported models are:
 * LTME-02A
 
