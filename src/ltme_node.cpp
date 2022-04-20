@@ -189,14 +189,188 @@ void LidarDriver::run()
           else
             ROS_WARN("Unable to set shadow filter strength");
         }
+#include "ltme_node/ltme_node.h"
 
-        if (receiver_sensitivity_boost_ != DEFAULT_RECEIVER_SENSITIVITY_BOOST) {
-          if (device_->setReceiverSensitivityBoost(receiver_sensitivity_boost_) == ldcp_sdk::no_error) {
-            ROS_INFO("Receiver sensitivity boost %d applied", receiver_sensitivity_boost_);
-            int current_receiver_sensitivity = 0;
-            if (device_->getReceiverSensitivityValue(current_receiver_sensitivity) == ldcp_sdk::no_error)
-              ROS_INFO("Current receiver sensitivity: %d", current_receiver_sensitivity);
+#include <arpa/inet.h>
+
+#include <sensor_msgs/LaserScan.h>
+
+const std::string LidarDriver::DEFAULT_ENFORCED_TRANSPORT_MODE = "none";
+const std::string LidarDriver::DEFAULT_FRAME_ID = "laser";
+const int LidarDriver::DEFAULT_SCAN_FREQUENCY = 15;
+const double LidarDriver::ANGLE_MIN_LIMIT = -2.356;
+const double LidarDriver::ANGLE_MAX_LIMIT = 2.356;
+const double LidarDriver::DEFAULT_ANGLE_EXCLUDED_MIN = -3.142;
+const double LidarDriver::DEFAULT_ANGLE_EXCLUDED_MAX = -3.142;
+const double LidarDriver::RANGE_MIN_LIMIT = 0.05;
+const double LidarDriver::RANGE_MAX_LIMIT = 30;
+const int LidarDriver::DEFAULT_AVERAGE_FACTOR = 1;
+
+LidarDriver::LidarDriver()
+  : nh_private_("~")
+  , hibernation_requested_(false)
+  , quit_driver_(false)
+{
+  if (!nh_private_.getParam("device_model", device_model_)) {
+    ROS_ERROR("Missing required parameter \"device_model\"");
+    exit(-1);
+  }
+  if (!nh_private_.getParam("device_address", device_address_)) {
+    ROS_ERROR("Missing required parameter \"device_address\"");
+    exit(-1);
+  }
+  nh_private_.param<std::string>("enforced_transport_mode", enforced_transport_mode_, DEFAULT_ENFORCED_TRANSPORT_MODE);
+  nh_private_.param<std::string>("frame_id", frame_id_, DEFAULT_FRAME_ID);
+  nh_private_.param<int>("scan_frequency_override", scan_frequency_override_, 0);
+  nh_private_.param<double>("angle_min", angle_min_, ANGLE_MIN_LIMIT);
+  nh_private_.param<double>("angle_max", angle_max_, ANGLE_MAX_LIMIT);
+  nh_private_.param<double>("angle_excluded_min", angle_excluded_min_, DEFAULT_ANGLE_EXCLUDED_MIN);
+  nh_private_.param<double>("angle_excluded_max", angle_excluded_max_, DEFAULT_ANGLE_EXCLUDED_MAX);
+  nh_private_.param<double>("range_min", range_min_, RANGE_MIN_LIMIT);
+  nh_private_.param<double>("range_max", range_max_, RANGE_MAX_LIMIT);
+  nh_private_.param<int>("average_factor", average_factor_, DEFAULT_AVERAGE_FACTOR);
+
+  if (!(enforced_transport_mode_ == "none" || enforced_transport_mode_ == "normal" || enforced_transport_mode_ == "oob")) {
+    ROS_ERROR("Transport mode \"%s\" not supported", enforced_transport_mode_.c_str());
+    exit(-1);
+  }
+  if (scan_frequency_override_ != 0 &&
+    (scan_frequency_override_ < 10 || scan_frequency_override_ > 30 || scan_frequency_override_ % 5 != 0)) {
+    ROS_ERROR("Scan frequency %d not supported", scan_frequency_override_);
+    exit(-1);
+  }
+  if (!(angle_min_ < angle_max_)) {
+    ROS_ERROR("angle_min (%f) can't be larger than or equal to angle_max (%f)", angle_min_, angle_max_);
+    exit(-1);
+  }
+  if (angle_min_ < ANGLE_MIN_LIMIT) {
+    ROS_ERROR("angle_min is set to %f while its minimum allowed value is %f", angle_min_, ANGLE_MIN_LIMIT);
+    exit(-1);
+  }
+  if (angle_max_ > ANGLE_MAX_LIMIT) {
+    ROS_ERROR("angle_max is set to %f while its maximum allowed value is %f", angle_max_, ANGLE_MAX_LIMIT);
+    exit(-1);
+  }
+  if (!(range_min_ < range_max_)) {
+    ROS_ERROR("range_min (%f) can't be larger than or equal to range_max (%f)", range_min_, range_max_);
+    exit(-1);
+  }
+  if (range_min_ < RANGE_MIN_LIMIT) {
+    ROS_ERROR("range_min is set to %f while its minimum allowed value is %f", range_min_, RANGE_MIN_LIMIT);
+    exit(-1);
+  }
+  if (range_max_ > RANGE_MAX_LIMIT) {
+    ROS_ERROR("range_max is set to %f while its maximum allowed value is %f", range_max_, RANGE_MAX_LIMIT);
+    exit(-1);
+  }
+  if (average_factor_ <= 0 || average_factor_ > 8) {
+    ROS_ERROR("average_factor is set to %d while its valid value is between 1 and 8", average_factor_);
+    exit(-1);
+  }
+}
+
+void LidarDriver::run()
+{
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  ros::Publisher laser_scan_publisher = nh_.advertise<sensor_msgs::LaserScan>("scan", 16);
+  ros::ServiceServer query_serial_service = nh_private_.advertiseService<ltme_node::QuerySerialRequest, ltme_node::QuerySerialResponse>
+    ("query_serial", std::bind(&LidarDriver::querySerialService, this, std::placeholders::_1, std::placeholders::_2));
+  ros::ServiceServer query_firmware_service = nh_private_.advertiseService<ltme_node::QueryFirmwareVersionRequest, ltme_node::QueryFirmwareVersionResponse>
+    ("query_firmware_version", std::bind(&LidarDriver::queryFirmwareVersion, this, std::placeholders::_1, std::placeholders::_2));
+  ros::ServiceServer query_hardware_service = nh_private_.advertiseService<ltme_node::QueryHardwareVersionRequest, ltme_node::QueryHardwareVersionResponse>
+    ("query_hardware_version", std::bind(&LidarDriver::queryHardwareVersion, this, std::placeholders::_1, std::placeholders::_2));
+  ros::ServiceServer request_hibernation_service = nh_private_.advertiseService<std_srvs::EmptyRequest, std_srvs::EmptyResponse>
+    ("request_hibernation", std::bind(&LidarDriver::requestHibernationService, this, std::placeholders::_1, std::placeholders::_2));
+  ros::ServiceServer request_wake_up_service = nh_private_.advertiseService<std_srvs::EmptyRequest, std_srvs::EmptyResponse>
+    ("request_wake_up", std::bind(&LidarDriver::requestWakeUpService, this, std::placeholders::_1, std::placeholders::_2));
+  ros::ServiceServer quit_driver_service = nh_private_.advertiseService<std_srvs::EmptyRequest, std_srvs::EmptyResponse>
+    ("quit_driver", std::bind(&LidarDriver::quitDriverService, this, std::placeholders::_1, std::placeholders::_2));
+
+  ros::AsyncSpinner spinner(1);
+  spinner.start();
+
+  std::string address_str = device_address_;
+  std::string port_str = "2105";
+
+  size_t position = device_address_.find(':');
+  if (position != std::string::npos) {
+    address_str = device_address_.substr(0, position);
+    port_str = device_address_.substr(position + 1);
+  }
+
+  in_addr_t address = htonl(INADDR_NONE);
+  in_port_t port = 0;
+  try {
+    address = inet_addr(address_str.c_str());
+    if (address == htonl(INADDR_NONE))
+      throw std::exception();
+    port = htons(std::stoi(port_str));
+  }
+  catch (...) {
+    ROS_ERROR("Invalid device address: %s", device_address_.c_str());
+    exit(-1);
+  }
+
+  ldcp_sdk::NetworkLocation location(address, port);
+  device_ = std::unique_ptr<ldcp_sdk::Device>(new ldcp_sdk::Device(location));
+
+  ros::Rate loop_rate(0.3);
+  while (nh_.ok() && !quit_driver_.load()) {
+    if (device_->open() == ldcp_sdk::no_error) {
+      hibernation_requested_ = false;
+
+      lock.unlock();
+
+      ROS_INFO("Device opened");
+
+      bool reboot_required = false;
+      if (enforced_transport_mode_ != "none") {
+        std::string firmware_version;
+        if (device_->queryFirmwareVersion(firmware_version) == ldcp_sdk::no_error) {
+          if (firmware_version < "0201")
+            ROS_WARN("Firmware version %s supports normal transport mode only, "
+              "\"enforced_transport_mode\" parameter will be ignored", firmware_version.c_str());
+          else {
+            bool oob_enabled = false;
+            if (device_->isOobEnabled(oob_enabled) == ldcp_sdk::no_error) {
+              if ((enforced_transport_mode_ == "normal" && oob_enabled) ||
+                  (enforced_transport_mode_ == "oob" && !oob_enabled)) {
+                ROS_INFO("Transport mode will be switched to \"%s\"", oob_enabled ? "normal" : "oob");
+                device_->setOobEnabled(!oob_enabled);
+                device_->persistSettings();
+                reboot_required = true;
+              }
+            }
+            else
+              ROS_WARN("Unable to query device for its current transport mode, "
+                "\"enforced_transport_mode\" parameter will be ignored");
           }
+        }
+        else
+          ROS_WARN("Unable to query device for firmware version, \"enforced_transport_mode\" parameter will be ignored");
+      }
+
+      if (!reboot_required) {
+        int scan_frequency = DEFAULT_SCAN_FREQUENCY;
+        int scan_frequency_now = 0;
+        device_->getScanFrequency(scan_frequency_now);
+        ROS_INFO("check scan_frequency_now %d ", scan_frequency_now);
+        if (scan_frequency_override_ != 0){ 
+          scan_frequency = scan_frequency_override_;
+
+          if (scan_frequency_now != scan_frequency_override_){
+          ROS_WARN("scan_frequency is %d need reboot ", scan_frequency);
+          device_->setScanFrequency(scan_frequency);
+          device_->persistSettings();
+          device_->reboot();
+          ROS_WARN("please restart the launch file");
+          }
+
+        }
+        else {
+          if (device_->getScanFrequency(scan_frequency) != ldcp_sdk::no_error)
+            ROS_WARN("Unable to query device for scan frequency and will use %d as the frequency value", scan_frequency);
         }
 
         device_->startMeasurement();
@@ -218,10 +392,9 @@ void LidarDriver::run()
 
         sensor_msgs::LaserScan laser_scan;
         laser_scan.header.frame_id = frame_id_;
-        laser_scan.angle_min = (!invert_frame_) ? angle_min_ : angle_max_;
-        laser_scan.angle_max = (!invert_frame_) ? angle_max_ : angle_min_;
-        laser_scan.angle_increment = ((!invert_frame_) ? 1 : -1) *
-            2 * M_PI / beam_count * average_factor_;
+        laser_scan.angle_min = angle_min_;
+        laser_scan.angle_max = angle_max_;
+        laser_scan.angle_increment = 2 * M_PI / beam_count * average_factor_;
         laser_scan.time_increment = 1.0 / scan_frequency / beam_count * average_factor_;
         laser_scan.scan_time = 1.0 / scan_frequency;
         laser_scan.range_min = range_min_;
