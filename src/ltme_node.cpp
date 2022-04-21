@@ -364,7 +364,7 @@ void LidarDriver::run()
           device_->setScanFrequency(scan_frequency);
           device_->persistSettings();
           device_->reboot();
-          ROS_WARN("please restart the launch file");
+          ROS_WARN("wait for some seconds...");
           }
 
         }
